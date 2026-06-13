@@ -302,4 +302,3 @@ Alternative phrasing:
 Central slogan:
 
 > Existing repair methods fix where failure is observed. PGIR fixes where failure propagation originates.
-

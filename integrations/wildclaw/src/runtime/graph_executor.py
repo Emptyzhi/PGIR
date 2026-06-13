@@ -174,4 +174,3 @@ class GraphExecutorAdapter(AgentExecutorAdapter):
                 for parents in remaining.values():
                     parents.discard(node_id)
         return order
-

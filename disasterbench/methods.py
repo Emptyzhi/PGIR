@@ -3079,4 +3079,3 @@ def _compute_contract_pass(contract_tree, step_results):
         return 1.0
     passed = sum(1 for i, res in enumerate(step_results) if _verify_step(res.get("output",""), contract_tree.get(str(i+1))))
     return passed / total
-
