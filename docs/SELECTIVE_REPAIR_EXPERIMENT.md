@@ -15,7 +15,9 @@ full-trace retry. The diagnostic phase compares:
 - `pgir_selective_verified_fallback`: existing cascade with one full replan
   after a local candidate cannot be validated. Once triggered, fallback uses
   full-trace acceptance semantics: a parsed complete plan is accepted without
-  another veto from the verifier that requested fallback;
+  another veto from the verifier that requested fallback. It also uses the
+  same unrestricted repair prompt as the full-trace baseline. Unresolved soft
+  semantic warnings are advisory and cannot stop execution;
 - `pgir_hard_contract_only`: only tool execution, required input, declared
   output, and schema mismatches can block execution;
 - `pgir_hard_contract_selective_fallback`: hard-contract repair plus one full

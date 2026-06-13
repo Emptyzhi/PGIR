@@ -395,6 +395,7 @@ class ExperimentHarness:
             "llm_requested_global_replans",
             "rejected_patch_repairs",
             "selective_fallbacks",
+            "unresolved_soft_semantic_advisories",
             "global_escalations",
             "blocking_taint_count",
             "non_blocking_deviation_count",

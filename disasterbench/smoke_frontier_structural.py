@@ -16,6 +16,7 @@ import methods
 from config import Config
 from data import Task, ToolSpec
 from methods import (
+    FullTraceRetryControl,
     PGIRDeterministicRulePatchOnly,
     PGIRFullTraceRepair,
     PGIRHiddenTaintAncestorRepair,
@@ -799,6 +800,18 @@ def main():
     summary["selective_fallback_skips_global_rules"] = (
         not selective_policy._allow_global_deterministic_rule_patch()
     )
+    full_trace_policy = FullTraceRetryControl("deepseek-v4-pro", cfg)
+    summary["selective_fallback_prompt_matches_full_trace"] = (
+        selective_policy._build_pgir_global_replan_prompt(
+            TASK, PLAN, [], {2}
+        )
+        == full_trace_policy._build_full_trace_repair_prompt(
+            TASK, PLAN, [], {2}
+        )
+    )
+    summary["soft_semantic_failure_is_advisory"] = (
+        selective_policy._soft_semantic_failure_is_advisory()
+    )
 
     assert results["local"]["global_escalations"] == 0, summary
     assert results["local"]["local_patch_repairs"] == 1, summary
@@ -876,6 +889,8 @@ def main():
     assert summary["repair_catalog_has_unused_tool"], summary
     assert summary["selective_fallback_unvetoed"], summary
     assert summary["selective_fallback_skips_global_rules"], summary
+    assert summary["selective_fallback_prompt_matches_full_trace"], summary
+    assert summary["soft_semantic_failure_is_advisory"], summary
 
     print(json.dumps(summary, indent=2, ensure_ascii=True))
 

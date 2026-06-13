@@ -937,6 +937,9 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
     def _selective_global_fallback_enabled(self) -> bool:
         return False
 
+    def _soft_semantic_failure_is_advisory(self) -> bool:
+        return False
+
     def _initial_plan_boundary_failures(self, task, plan):
         return _rule_failure_indices(task, plan)
 
@@ -1001,6 +1004,7 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
         unrepaired_boundary_step = None
         unrepaired_boundary_reason = None
         unrepaired_boundary_tainted_nodes = []
+        unresolved_soft_semantic_advisories = 0
         index = 0
         plan_failed, plan_budget, plan_complete = self._initial_plan_boundary_failures(task, plan)
         if plan_budget is not None:
@@ -1053,11 +1057,16 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
                 tainted = set()
                 index = len(step_results)
             elif repair_result:
-                stopped_at_unrepaired_boundary = True
-                unrepaired_boundary_type = "plan_boundary"
-                unrepaired_boundary_step = 0
-                unrepaired_boundary_reason = repair_result.get("attempt_record", {}).get("reason")
-                unrepaired_boundary_tainted_nodes = sorted(tainted)
+                if self._soft_semantic_failure_is_advisory():
+                    unresolved_soft_semantic_advisories += 1
+                    contamination_events = []
+                    tainted = set()
+                else:
+                    stopped_at_unrepaired_boundary = True
+                    unrepaired_boundary_type = "plan_boundary"
+                    unrepaired_boundary_step = 0
+                    unrepaired_boundary_reason = repair_result.get("attempt_record", {}).get("reason")
+                    unrepaired_boundary_tainted_nodes = sorted(tainted)
         while index < len(plan) and not stopped_at_unrepaired_boundary:
             step = plan[index]
             step_idx = index + 1
@@ -1228,11 +1237,14 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
                 boundary_repairs += 1
                 global_escalated = global_escalated or repair_result["global_escalated"]
             else:
-                stopped_at_unrepaired_boundary = True
-                unrepaired_boundary_type = "final_commit"
-                unrepaired_boundary_step = len(plan)
-                unrepaired_boundary_reason = repair_result.get("attempt_record", {}).get("reason")
-                unrepaired_boundary_tainted_nodes = sorted(final_tainted)
+                if self._soft_semantic_failure_is_advisory():
+                    unresolved_soft_semantic_advisories += 1
+                else:
+                    stopped_at_unrepaired_boundary = True
+                    unrepaired_boundary_type = "final_commit"
+                    unrepaired_boundary_step = len(plan)
+                    unrepaired_boundary_reason = repair_result.get("attempt_record", {}).get("reason")
+                    unrepaired_boundary_tainted_nodes = sorted(final_tainted)
         final_output = step_results[-1].get("output", "") if step_results else ""
         unchanged_steps = sum(
             1
@@ -1312,6 +1324,7 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
                 else "hard_and_soft_semantic"
             ),
             "selective_global_fallback_enabled": self._selective_global_fallback_enabled(),
+            "unresolved_soft_semantic_advisories": unresolved_soft_semantic_advisories,
             "stopped_at_unrepaired_boundary": stopped_at_unrepaired_boundary,
             "unrepaired_boundary_type": unrepaired_boundary_type,
             "unrepaired_boundary_step": unrepaired_boundary_step,
@@ -2384,6 +2397,40 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
         except:
             return {}
 
+def _build_unrestricted_full_trace_prompt(
+    task,
+    plan,
+    step_results,
+    failed_steps,
+    diagnosed_step_budget=None,
+):
+    lines = [
+        "The previous execution produced a weak or failed plan. Below is the full trace. "
+        "Regenerate the complete plan from scratch to complete the task successfully."
+    ]
+    lines.append(f"Task: {task.description}")
+    lines.append(f"Available tools: {_format_tool_catalog(task)}")
+    lines.append(f"Current plan: {json.dumps(plan, ensure_ascii=False)}")
+    lines.append(f"Diagnosed failed or redundant steps: {sorted(failed_steps)}")
+    if diagnosed_step_budget is not None:
+        lines.append(
+            f"Verifier-estimated maximum necessary plan length: {diagnosed_step_budget} steps."
+        )
+    for i, res in enumerate(step_results):
+        step = plan[i] if i < len(plan) else {"tool": "unknown", "params": {}}
+        lines.append(
+            f"Step {i+1}: tool={step['tool']} params={step.get('params',{})} "
+            f"output={res.get('output','')} success={res['success']}"
+        )
+    lines.append(
+        "Output only a complete revised JSON list with step_idx, tool, params, "
+        "dependencies, outputs, and dependence_content. Use the smallest sufficient "
+        "plan; remove redundant optional steps and route downstream inputs through "
+        "relevant prior outputs."
+    )
+    return "\n".join(lines)
+
+
 # ----------------------------------------------------------------------
 # Control: Full trace retry
 # ----------------------------------------------------------------------
@@ -2443,28 +2490,13 @@ class FullTraceRetryControl(BaseRepairMethod):
         return results
 
     def _build_full_trace_repair_prompt(self, task, plan, step_results, failed_steps):
-        lines = [
-            "The previous execution produced a weak or failed plan. Below is the full trace. "
-            "Regenerate the complete plan from scratch to complete the task successfully."
-        ]
-        lines.append(f"Task: {task.description}")
-        lines.append(f"Available tools: {_format_tool_catalog(task)}")
-        lines.append(f"Current plan: {json.dumps(plan, ensure_ascii=False)}")
-        lines.append(f"Diagnosed failed or redundant steps: {sorted(failed_steps)}")
-        if self._diagnosed_step_budget is not None:
-            lines.append(
-                f"Verifier-estimated maximum necessary plan length: {self._diagnosed_step_budget} steps."
-            )
-        for i, res in enumerate(step_results):
-            step = plan[i] if i < len(plan) else {"tool": "unknown", "params": {}}
-            lines.append(f"Step {i+1}: tool={step['tool']} params={step.get('params',{})} output={res.get('output','')} success={res['success']}")
-        lines.append(
-            "Output only a complete revised JSON list with step_idx, tool, params, "
-            "dependencies, outputs, and dependence_content. Use the smallest sufficient "
-            "plan; remove redundant optional steps and route downstream inputs through "
-            "relevant prior outputs."
+        return _build_unrestricted_full_trace_prompt(
+            task,
+            plan,
+            step_results,
+            failed_steps,
+            self._diagnosed_step_budget,
         )
-        return "\n".join(lines)
 
     def _parse_plan(self, text):
         return _coerce_plan_text(text, self.task) if self.task else []
@@ -2966,6 +2998,9 @@ class PGIRSelectiveVerifiedFallback(PGIRHiddenTaintAncestorRepair):
     def _selective_global_fallback_enabled(self) -> bool:
         return True
 
+    def _soft_semantic_failure_is_advisory(self) -> bool:
+        return True
+
     def _allow_global_deterministic_rule_patch(self) -> bool:
         return False
 
@@ -2973,6 +3008,22 @@ class PGIRSelectiveVerifiedFallback(PGIRHiddenTaintAncestorRepair):
         # Match the full-trace baseline once localized repair has failed. The
         # original verifier may propose fallback, but cannot veto it again.
         return bool(repaired)
+
+    def _build_pgir_global_replan_prompt(
+        self,
+        task,
+        plan,
+        step_results,
+        failed_steps,
+        **kwargs,
+    ):
+        return _build_unrestricted_full_trace_prompt(
+            task,
+            plan,
+            step_results,
+            failed_steps,
+            self._diagnosed_step_budget,
+        )
 
 
 class PGIRHardContractOnly(PGIRHiddenTaintAncestorRepair):
