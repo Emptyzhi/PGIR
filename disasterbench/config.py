@@ -65,6 +65,17 @@ class Config:
         self.tavily_calls_per_task = 3
 
         self.phases_definition = {
+            "selective_fallback_unvetoed_10": {
+                "models": ["deepseek-v4-pro"],
+                "datasets": ["DisasterBench_local_graph_rewrite"],
+                "conditions": [
+                    "full_trace_retry_control",
+                    "pgir_selective_verified_fallback",
+                ],
+                "subset_sizes": {"DisasterBench_local_graph_rewrite": 10},
+                "stratify": False,
+                "seeds": [0],
+            },
             "selective_repair_diagnostic_10": {
                 "models": ["deepseek-v4-pro"],
                 "datasets": ["DisasterBench_local_graph_rewrite"],

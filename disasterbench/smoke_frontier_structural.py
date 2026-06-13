@@ -21,6 +21,7 @@ from methods import (
     PGIRHiddenTaintAncestorRepair,
     PGIRHardContractOnly,
     PGIRLLMForcedLocalPatch,
+    PGIRSelectiveVerifiedFallback,
     PGIRVerifierGuidedLocalPruneOnly,
     PGIRVisibleTaintLabels,
 )
@@ -791,6 +792,13 @@ def main():
     summary["repair_catalog_has_unused_tool"] = (
         "unused_specialist" in helper._repair_tool_catalog(TASK, PLAN)
     )
+    selective_policy = PGIRSelectiveVerifiedFallback("deepseek-v4-pro", cfg)
+    summary["selective_fallback_unvetoed"] = selective_policy._global_replan_is_acceptable(
+        [PLAN[0]], PLAN, TASK
+    )
+    summary["selective_fallback_skips_global_rules"] = (
+        not selective_policy._allow_global_deterministic_rule_patch()
+    )
 
     assert results["local"]["global_escalations"] == 0, summary
     assert results["local"]["local_patch_repairs"] == 1, summary
@@ -866,6 +874,8 @@ def main():
     assert fanin_events[0]["responsible_nodes"] == [1, 2], summary
     assert summary["adapter_removed"], summary
     assert summary["repair_catalog_has_unused_tool"], summary
+    assert summary["selective_fallback_unvetoed"], summary
+    assert summary["selective_fallback_skips_global_rules"], summary
 
     print(json.dumps(summary, indent=2, ensure_ascii=True))
 

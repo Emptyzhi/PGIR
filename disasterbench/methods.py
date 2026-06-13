@@ -961,6 +961,9 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
     def _allow_deterministic_rule_patch(self) -> bool:
         return True
 
+    def _allow_global_deterministic_rule_patch(self) -> bool:
+        return self._allow_deterministic_rule_patch()
+
     def _allow_llm_local_patch(self) -> bool:
         return True
 
@@ -2008,7 +2011,7 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
             repaired_rule_failed, _, _ = _rule_failure_indices(task, repaired)
             deterministic = (
                 _deterministic_rule_repair_plan(task, repaired, repaired_rule_failed)
-                if self._allow_deterministic_rule_patch()
+                if self._allow_global_deterministic_rule_patch()
                 else None
             )
             global_source = "llm_global_replan"
@@ -2038,7 +2041,14 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
                         global_source,
                     ),
                 }
-            attempt = self._attempt_record("global_replan", False, frontier, scope, "global_replan_quality_rejected")
+            attempt = self._attempt_record(
+                "global_replan",
+                False,
+                frontier,
+                scope,
+                "global_replan_quality_rejected",
+                "llm_global_replan",
+            )
             return {
                 "repaired": False,
                 "plan": plan,
@@ -2955,6 +2965,14 @@ class PGIRSelectiveVerifiedFallback(PGIRHiddenTaintAncestorRepair):
 
     def _selective_global_fallback_enabled(self) -> bool:
         return True
+
+    def _allow_global_deterministic_rule_patch(self) -> bool:
+        return False
+
+    def _global_replan_is_acceptable(self, repaired, current, task) -> bool:
+        # Match the full-trace baseline once localized repair has failed. The
+        # original verifier may propose fallback, but cannot veto it again.
+        return bool(repaired)
 
 
 class PGIRHardContractOnly(PGIRHiddenTaintAncestorRepair):
