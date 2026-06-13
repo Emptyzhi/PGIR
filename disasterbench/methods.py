@@ -934,6 +934,30 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
     def _visible_taint_enabled(self) -> bool:
         return False
 
+    def _selective_global_fallback_enabled(self) -> bool:
+        return False
+
+    def _initial_plan_boundary_failures(self, task, plan):
+        return _rule_failure_indices(task, plan)
+
+    def _repair_tool_catalog(self, task, plan) -> str:
+        # Keep repair information parity with full-trace retry. Frontier
+        # localization, not a smaller hand-selected tool menu, should account
+        # for any difference between the methods.
+        return _format_tool_catalog(task)
+
+    def _post_patch_rule_failures(self, task, plan):
+        return _rule_failure_indices(task, plan)[0]
+
+    def _global_replan_is_acceptable(self, repaired, current, task) -> bool:
+        return bool(repaired) and _plan_quality(repaired, task) >= _plan_quality(current, task)
+
+    def _local_patch_quality_is_acceptable(self, repaired, current, task) -> bool:
+        return not (
+            len(repaired) == len(current)
+            and _plan_quality(repaired, task) < _plan_quality(current, task)
+        )
+
     def _allow_deterministic_rule_patch(self) -> bool:
         return True
 
@@ -975,7 +999,7 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
         unrepaired_boundary_reason = None
         unrepaired_boundary_tainted_nodes = []
         index = 0
-        plan_failed, plan_budget, plan_complete = _rule_failure_indices(task, plan)
+        plan_failed, plan_budget, plan_complete = self._initial_plan_boundary_failures(task, plan)
         if plan_budget is not None:
             self._diagnosed_step_budget = plan_budget
         if plan_failed and not plan_complete:
@@ -1279,6 +1303,12 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
             ),
             "diagnosed_first_failure": min(frontier_nodes) if frontier_nodes else None,
             "runtime_repair_mode": "deferred_frontier_repair",
+            "verifier_policy": (
+                "hard_contract_only"
+                if not self._soft_semantic_verifier_enabled()
+                else "hard_and_soft_semantic"
+            ),
+            "selective_global_fallback_enabled": self._selective_global_fallback_enabled(),
             "stopped_at_unrepaired_boundary": stopped_at_unrepaired_boundary,
             "unrepaired_boundary_type": unrepaired_boundary_type,
             "unrepaired_boundary_step": unrepaired_boundary_step,
@@ -1345,6 +1375,10 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
                 1 for attempt in repair_attempts
                 if attempt.get("mode") == "local_patch" and not attempt.get("accepted")
             ),
+            "selective_fallbacks": sum(
+                1 for attempt in repair_attempts
+                if str(attempt.get("source", "")).startswith("selective_fallback_after_")
+            ),
             "global_escalations": 1 if global_escalated else 0,
             "blocking_taint_count": len(blocking_events),
             "non_blocking_deviation_count": len(non_blocking_events),
@@ -1388,6 +1422,9 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
 
     def _diagnose_semantic_failures(self, task, plan, step_results) -> set:
         return self._semantic_failure_indices(task, plan, step_results)
+
+    def _soft_semantic_verifier_enabled(self) -> bool:
+        return True
 
     def _propagate_taint(self, step_idx: int, deps: dict, tainted: set):
         for child, parents in deps.items():
@@ -1629,6 +1666,71 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
             "taint_visibility": "visible" if self._visible_taint_enabled() else "hidden",
         }
 
+    def _failed_local_result(
+        self,
+        task,
+        plan,
+        step_results,
+        contract_tree,
+        dependencies,
+        contamination_events,
+        local_attempts,
+        global_attempts,
+        frontier,
+        scope,
+        reason,
+        source=None,
+    ):
+        if self._selective_global_fallback_enabled():
+            fallback = self._repair_from_contamination_frontier(
+                task,
+                plan,
+                step_results,
+                contract_tree,
+                dependencies,
+                contamination_events,
+                local_attempts,
+                global_attempts,
+                force_global=True,
+            )
+            record = fallback.get("attempt_record")
+            if record:
+                record["fallback_global_source"] = record.get("source")
+                record["fallback_reason"] = reason
+                record["fallback_source"] = source
+                record["source"] = f"selective_fallback_after_{reason}"
+            return fallback
+        attempt = self._attempt_record("local_patch", False, frontier, scope, reason, source)
+        return {
+            "repaired": False,
+            "plan": plan,
+            "step_results": step_results,
+            "reexecuted": 0,
+            "repair_scope": scope,
+            "frontier": frontier,
+            "affected": scope,
+            "global_escalated": False,
+            "attempt_record": attempt,
+        }
+
+    def _counterfactual_hard_contract_passes(self, task, plan, step_results) -> bool:
+        """Validate a repaired prefix using only execution-grounded hard contracts."""
+        contracts = _build_runtime_contract_tree(plan, task)
+        for index, result in enumerate(step_results, start=1):
+            if index > len(plan) or not result.get("success"):
+                return False
+            step = plan[index - 1]
+            contract = contracts.get(str(index), {})
+            if step.get("tool") != contract.get("expected_tool"):
+                return False
+            required = set(contract.get("required_inputs", []))
+            if required - set((step.get("params") or {}).keys()):
+                return False
+            expected_outputs = set(contract.get("expected_outputs", []))
+            if expected_outputs - set(step.get("outputs", [])):
+                return False
+        return True
+
     def _normalize_patch_step(self, item, task, step_idx):
         if not isinstance(item, dict):
             return None
@@ -1865,24 +1967,19 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
         )
         use_global = force_global or non_localizable
         if local_operator_exhausted and not use_global:
-            attempt = self._attempt_record(
-                "local_patch",
-                False,
+            return self._failed_local_result(
+                task,
+                plan,
+                step_results,
+                contract_tree,
+                dependencies,
+                contamination_events,
+                local_attempts,
+                global_attempts,
                 frontier,
                 scope,
                 "local_repair_operator_cap_exhausted_frontier_still_localizable",
             )
-            return {
-                "repaired": False,
-                "plan": plan,
-                "step_results": step_results,
-                "reexecuted": 0,
-                "repair_scope": scope,
-                "frontier": frontier,
-                "affected": scope,
-                "global_escalated": False,
-                "attempt_record": attempt,
-            }
         if use_global and global_attempts >= getattr(self.config, "pgir_global_replan_retry_cap", 1):
             attempt = self._attempt_record("global_replan", False, frontier, scope, "global_replan_cap_exhausted")
             return {
@@ -1918,7 +2015,7 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
             if deterministic:
                 repaired = deterministic
                 global_source = "llm_global_replan_with_deterministic_rule_patch"
-            if repaired and _plan_quality(repaired, task) >= _plan_quality(plan, task):
+            if self._global_replan_is_acceptable(repaired, plan, task):
                 new_results = [
                     benv.execute_tool(task, step["tool"], step.get("params", {}))
                     for step in repaired
@@ -1977,25 +2074,20 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
                 source = "deterministic_rule_patch"
             else:
                 if not self._allow_llm_local_patch():
-                    attempt = self._attempt_record(
-                        "local_patch",
-                        False,
+                    return self._failed_local_result(
+                        task,
+                        plan,
+                        step_results,
+                        contract_tree,
+                        dependencies,
+                        contamination_events,
+                        local_attempts,
+                        global_attempts,
                         frontier,
                         scope,
                         "no_enabled_local_operator_available",
                         "local_operator_disabled",
                     )
-                    return {
-                        "repaired": False,
-                        "plan": plan,
-                        "step_results": step_results,
-                        "reexecuted": 0,
-                        "repair_scope": scope,
-                        "frontier": frontier,
-                        "affected": scope,
-                        "global_escalated": False,
-                        "attempt_record": attempt,
-                    }
                 repair_prompt = self._build_pgir_repair_prompt(
                     task,
                     plan,
@@ -2014,51 +2106,33 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
                     source = "llm_requested_global_replan"
         valid_patch, rejection_reason = self._local_patch_is_valid(plan, repaired, scope)
         if not valid_patch:
-            attempt = self._attempt_record("local_patch", False, frontier, scope, rejection_reason, source)
-            return {
-                "repaired": False,
-                "plan": plan,
-                "step_results": step_results,
-                "reexecuted": 0,
-                "repair_scope": scope,
-                "frontier": frontier,
-                "affected": scope,
-                "global_escalated": False,
-                "attempt_record": attempt,
-            }
-        repaired_rule_failed, _, _ = _rule_failure_indices(task, repaired)
+            return self._failed_local_result(
+                task, plan, step_results, contract_tree, dependencies,
+                contamination_events, local_attempts, global_attempts,
+                frontier, scope, rejection_reason, source,
+            )
+        repaired_rule_failed = self._post_patch_rule_failures(task, repaired)
         if repaired_rule_failed:
-            attempt = self._attempt_record("local_patch", False, frontier, scope, "residual_rule_failure", source)
-            return {
-                "repaired": False,
-                "plan": plan,
-                "step_results": step_results,
-                "reexecuted": 0,
-                "repair_scope": scope,
-                "frontier": frontier,
-                "affected": scope,
-                "global_escalated": False,
-                "attempt_record": attempt,
-            }
-        if (
-            len(repaired) == len(plan)
-            and _plan_quality(repaired, task) < _plan_quality(plan, task)
-        ):
-            attempt = self._attempt_record("local_patch", False, frontier, scope, "local_patch_quality_rejected", source)
-            return {
-                "repaired": False,
-                "plan": plan,
-                "step_results": step_results,
-                "reexecuted": 0,
-                "repair_scope": scope,
-                "frontier": frontier,
-                "affected": scope,
-                "global_escalated": False,
-                "attempt_record": attempt,
-            }
+            return self._failed_local_result(
+                task, plan, step_results, contract_tree, dependencies,
+                contamination_events, local_attempts, global_attempts,
+                frontier, scope, "residual_rule_failure", source,
+            )
+        if not self._local_patch_quality_is_acceptable(repaired, plan, task):
+            return self._failed_local_result(
+                task, plan, step_results, contract_tree, dependencies,
+                contamination_events, local_attempts, global_attempts,
+                frontier, scope, "local_patch_quality_rejected", source,
+            )
         new_results, reexecuted = self._execute_repaired_frontier(
             task, plan, repaired, step_results, scope, len(step_results)
         )
+        if not self._counterfactual_hard_contract_passes(task, repaired, new_results):
+            return self._failed_local_result(
+                task, plan, step_results, contract_tree, dependencies,
+                contamination_events, local_attempts, global_attempts,
+                frontier, scope, "counterfactual_hard_contract_failed", source,
+            )
         return {
             "repaired": True,
             "plan": repaired,
@@ -2158,7 +2232,7 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
     ):
         lines = ["Repair the following execution using PGIR failure-propagation repair: "]
         lines.append(f"Task: {task.description}")
-        lines.append(f"Relevant tools: {_format_repair_tool_catalog(task, plan)}")
+        lines.append(f"Relevant tools: {self._repair_tool_catalog(task, plan)}")
         lines.append(f"Current plan: {json.dumps(plan, ensure_ascii=False)}")
         if contamination_events is not None and visible_labels:
             lines.append(
@@ -2255,7 +2329,7 @@ class PGIRHiddenTaintAncestorRepair(BaseRepairMethod):
             "text, public tool schemas, and the execution trace."
         ]
         lines.append(f"Task: {task.description}")
-        lines.append(f"Relevant tools: {_format_repair_tool_catalog(task, plan)}")
+        lines.append(f"Relevant tools: {self._repair_tool_catalog(task, plan)}")
         lines.append(f"Current plan: {json.dumps(plan, ensure_ascii=False)}")
         if visible_labels and contamination_events is not None:
             lines.append(
@@ -2872,6 +2946,84 @@ class AgentRxDiagnosisFailureLocalization(BaseRepairMethod):
             return int(resp.strip())
         except:
             return None
+
+# ----------------------------------------------------------------------
+# Diagnostic conditions: verifier authority and selective fallback
+# ----------------------------------------------------------------------
+class PGIRSelectiveVerifiedFallback(PGIRHiddenTaintAncestorRepair):
+    """Fall back to one full replan when a localized candidate cannot be validated."""
+
+    def _selective_global_fallback_enabled(self) -> bool:
+        return True
+
+
+class PGIRHardContractOnly(PGIRHiddenTaintAncestorRepair):
+    """Let only execution-grounded schema/tool failures block execution."""
+
+    def _soft_semantic_verifier_enabled(self) -> bool:
+        return False
+
+    def _initial_plan_boundary_failures(self, task, plan):
+        return set(), None, False
+
+    def _diagnose_semantic_failures(self, task, plan, step_results) -> set:
+        return set()
+
+    def _classify_step_outcome(self, step_idx, step, result, contract):
+        if not result.get("success"):
+            return self._make_contamination_event(
+                step_idx,
+                "blocking_taint",
+                "tool_execution_failure",
+                [step_idx],
+                result.get("error") or "Tool execution failed.",
+                "action_output",
+            )
+        if contract is None:
+            return self._make_contamination_event(step_idx, "pass", "none", [], "", "action_output")
+        if step.get("tool") != contract.get("expected_tool"):
+            return self._make_contamination_event(
+                step_idx, "blocking_taint", "tool_contract_mismatch", [step_idx],
+                "Executed tool does not match the contract expected tool.", "action_output",
+            )
+        required = set(contract.get("required_inputs", []))
+        missing = sorted(required - set((step.get("params") or {}).keys()))
+        if missing:
+            return self._make_contamination_event(
+                step_idx, "blocking_taint", "missing_required_input", [step_idx],
+                f"Missing required input(s): {missing}", "action_output",
+            )
+        expected_outputs = set(contract.get("expected_outputs", []))
+        missing_outputs = sorted(expected_outputs - set(step.get("outputs", [])))
+        if missing_outputs:
+            return self._make_contamination_event(
+                step_idx, "blocking_taint", "missing_declared_output", [step_idx],
+                f"Missing declared output(s): {missing_outputs}", "action_output",
+            )
+        return self._make_contamination_event(step_idx, "pass", "none", [], "", "action_output")
+
+    def _allow_deterministic_rule_patch(self) -> bool:
+        return False
+
+    def _allow_verifier_guided_local_prune(self) -> bool:
+        return False
+
+    def _post_patch_rule_failures(self, task, plan):
+        return set()
+
+    def _global_replan_is_acceptable(self, repaired, current, task) -> bool:
+        return bool(repaired)
+
+    def _local_patch_quality_is_acceptable(self, repaired, current, task) -> bool:
+        return bool(repaired)
+
+
+class PGIRHardContractSelectiveFallback(PGIRHardContractOnly):
+    """Hard-contract runtime repair with one full-trace fallback."""
+
+    def _selective_global_fallback_enabled(self) -> bool:
+        return True
+
 
 # ----------------------------------------------------------------------
 # Ablation: Visible taint labels

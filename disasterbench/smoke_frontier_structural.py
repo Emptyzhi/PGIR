@@ -19,6 +19,7 @@ from methods import (
     PGIRDeterministicRulePatchOnly,
     PGIRFullTraceRepair,
     PGIRHiddenTaintAncestorRepair,
+    PGIRHardContractOnly,
     PGIRLLMForcedLocalPatch,
     PGIRVerifierGuidedLocalPruneOnly,
     PGIRVisibleTaintLabels,
@@ -33,6 +34,7 @@ TOOLS = [
     ToolSpec("collect", "collect", {"query": "string"}),
     ToolSpec("transform", "transform", {"input": "string", "fixed": "string"}),
     ToolSpec("aggregate", "aggregate", {"input": "string"}),
+    ToolSpec("unused_specialist", "unused", {"input": "string"}),
 ]
 
 TASK = Task(
@@ -577,6 +579,31 @@ class UnrepairableConsumptionPGIR(BaseSynthetic):
         return json.dumps({"patch_steps": []})
 
 
+class SelectiveFallbackPGIR(UnrepairableConsumptionPGIR):
+    def _selective_global_fallback_enabled(self):
+        return True
+
+    def _call_llm_repair(self, prompt):
+        self.prompts.append(prompt)
+        if "Escalate once to a complete ancestor/root-path replan" in prompt:
+            repaired = [dict(step) for step in PLAN]
+            repaired[1] = dict(repaired[1])
+            repaired[1]["params"] = {
+                "input": "<GENERATED>-1-output",
+                "fixed": "yes",
+            }
+            return json.dumps(repaired)
+        return json.dumps({"patch_steps": []})
+
+
+class HardContractIgnoresSoftSemanticPGIR(PGIRHardContractOnly):
+    def _generate_initial_plan(self, task):
+        return [dict(step) for step in FINAL_COMMIT_PLAN]
+
+    def _call_llm_repair(self, prompt):
+        raise AssertionError("hard-contract-only condition should not call repair for soft semantics")
+
+
 class RuleOnlySynthetic(PGIRDeterministicRulePatchOnly, BaseSynthetic):
     pass
 
@@ -606,6 +633,8 @@ def main():
         "local_graph_rewrite": LocalGraphRewritePGIR("deepseek-v4-pro", cfg),
         "final_commit": FinalCommitPGIR("deepseek-v4-pro", cfg),
         "unrepairable_consumption": UnrepairableConsumptionPGIR("deepseek-v4-pro", cfg),
+        "selective_fallback": SelectiveFallbackPGIR("deepseek-v4-pro", cfg),
+        "hard_contract_only": HardContractIgnoresSoftSemanticPGIR("deepseek-v4-pro", cfg),
     }
     results = {name: runner.run_task_and_repair(TASK) for name, runner in runners.items()}
 
@@ -759,6 +788,9 @@ def main():
     summary["fanin_events"] = fanin_events
     removed_adapter_symbol = "_schema" + "_text" + "_direct" + "_plan"
     summary["adapter_removed"] = not hasattr(methods, removed_adapter_symbol)
+    summary["repair_catalog_has_unused_tool"] = (
+        "unused_specialist" in helper._repair_tool_catalog(TASK, PLAN)
+    )
 
     assert results["local"]["global_escalations"] == 0, summary
     assert results["local"]["local_patch_repairs"] == 1, summary
@@ -818,6 +850,11 @@ def main():
     assert results["unrepairable_consumption"]["unrepaired_boundary_step"] == 3, summary
     assert results["unrepairable_consumption"]["executed_step_count"] == 2, summary
     assert results["unrepairable_consumption"]["final_output"] == "bad transform", summary
+    assert results["selective_fallback"]["stopped_at_unrepaired_boundary"] is False, summary
+    assert results["selective_fallback"]["global_escalations"] == 1, summary
+    assert results["selective_fallback"]["selective_fallbacks"] == 1, summary
+    assert results["hard_contract_only"]["repair_calls"] == 0, summary
+    assert results["hard_contract_only"]["verifier_policy"] == "hard_contract_only", summary
     assert nonblocking["status"] == "non_blocking_deviation", summary
     assert nonblocking_boundary is False, summary
     assert inferred_deps == {1: [], 2: [1], 3: [2]}, summary
@@ -828,6 +865,7 @@ def main():
     assert fanin_events and fanin_events[0]["boundary"] == "fan_in_aggregation", summary
     assert fanin_events[0]["responsible_nodes"] == [1, 2], summary
     assert summary["adapter_removed"], summary
+    assert summary["repair_catalog_has_unused_tool"], summary
 
     print(json.dumps(summary, indent=2, ensure_ascii=True))
 

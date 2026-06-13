@@ -25,6 +25,9 @@ from methods import (
     PGIRDeterministicRulePatchOnly,
     PGIRVerifierGuidedLocalPruneOnly,
     PGIRLLMForcedLocalPatch,
+    PGIRSelectiveVerifiedFallback,
+    PGIRHardContractOnly,
+    PGIRHardContractSelectiveFallback,
 )
 from scorer import audit_prompt_contamination, score_disasterbench_plan
 
@@ -36,6 +39,9 @@ CONDITION_CLASSES = {
     "pgir_deterministic_rule_patch_only": PGIRDeterministicRulePatchOnly,
     "pgir_verifier_guided_local_prune_only": PGIRVerifierGuidedLocalPruneOnly,
     "pgir_llm_forced_local_patch": PGIRLLMForcedLocalPatch,
+    "pgir_selective_verified_fallback": PGIRSelectiveVerifiedFallback,
+    "pgir_hard_contract_only": PGIRHardContractOnly,
+    "pgir_hard_contract_selective_fallback": PGIRHardContractSelectiveFallback,
     "no_repair_control": NoRepairControl,
     "full_trace_retry_control": FullTraceRetryControl,
     "binary_checkpoint_rollback_control": BinaryCheckpointRollbackControl,
@@ -388,6 +394,7 @@ class ExperimentHarness:
             "interface_preserving_local_graph_rewrites",
             "llm_requested_global_replans",
             "rejected_patch_repairs",
+            "selective_fallbacks",
             "global_escalations",
             "blocking_taint_count",
             "non_blocking_deviation_count",
