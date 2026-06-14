@@ -45,6 +45,7 @@ def fake_call_llm(self, prompt, max_tokens=None):
     if max_tokens is None:
         max_tokens = self.config.max_tokens_per_step
     self.total_tokens += len(prompt.split()) + max_tokens
+    self.llm_calls += 1
     self.prompts.append(prompt)
     return json.dumps(OFFLINE_PLAN)
 
@@ -61,6 +62,14 @@ def main():
         "models": ["deepseek-v4-pro"],
         "datasets": ["DisasterBench_smoke"],
         "conditions": [
+            "no_repair_control",
+            "binary_checkpoint_rollback_control",
+            "local_leaf_retry_no_ancestor_control",
+            "no_contract_retry_control",
+            "reflexion_verbal_retry",
+            "post_tool_reflection_rag_repair",
+            "agentrx_diagnosis_failure_localization",
+            "agentfixer_single_trace_recommendation_retry",
             "pgir_hidden_taint_ancestor_repair",
             "full_trace_retry_control",
         ],
@@ -74,10 +83,11 @@ def main():
     results_path = RESULTS_DIR / "results.json"
     results = json.loads(results_path.read_text(encoding="utf-8"))
     records = results["codex_offline_harness_smoke"]
-    assert len(records) == 2, records
+    assert len(records) == 10, records
     assert not any("error" in record for record in records), records
     assert "primary_metric_summary" in results, results.keys()
     assert "tuning_parity" in results, results.keys()
+    assert results["baseline_fairness_audit"]["pass"], results["baseline_fairness_audit"]
     assert "contamination_audit" in results, results.keys()
 
     summary = {
@@ -96,6 +106,7 @@ def main():
             for record in records
         ],
         "tuning_parity_pass": results["tuning_parity"].get("pass"),
+        "baseline_fairness_audit_pass": results["baseline_fairness_audit"].get("pass"),
         "contamination_audit_pass": results["contamination_audit"].get("pass"),
     }
     print(json.dumps(summary, indent=2, ensure_ascii=True))

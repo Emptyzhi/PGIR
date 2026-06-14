@@ -6,6 +6,7 @@ import time
 import json
 import copy
 import re
+import hashlib
 from typing import Dict, Any, List, Optional, Tuple
 from abc import ABC, abstractmethod
 
@@ -32,9 +33,13 @@ class BaseRepairMethod(ABC):
         self.search = SearchClient(api_key=config.tavily_api_key, max_calls=config.tavily_calls_per_task)
         self.total_tokens = 0
         self.repair_prompt_tokens_used = 0
+        self.llm_calls = 0
+        self.repair_llm_calls = 0
         self.task = None
         self.prompts = []   # for contamination audit
         self.last_plan = []
+        self.initial_plan_snapshot = []
+        self.initial_plan_fingerprint = ""
         self._diagnosed_step_budget = None
 
     def call_llm(self, prompt: str, max_tokens: Optional[int] = None) -> str:
@@ -42,6 +47,7 @@ class BaseRepairMethod(ABC):
             max_tokens = self.config.max_tokens_per_step
         # approximate token count (real token count could be obtained from API response, but we use length/4)
         self.total_tokens += len(prompt.split()) + max_tokens
+        self.llm_calls += 1
         self.prompts.append(prompt)
         return self.llm.chat_completion(prompt, max_tokens)
 
@@ -49,6 +55,7 @@ class BaseRepairMethod(ABC):
         if max_tokens is None:
             max_tokens = self.config.max_repair_tokens
         self.repair_prompt_tokens_used += len(prompt.split()) + max_tokens
+        self.repair_llm_calls += 1
         return self.call_llm(prompt, max_tokens)
 
     @abstractmethod
@@ -832,12 +839,22 @@ def _generate_shared_initial_plan(method: BaseRepairMethod, task: Task) -> List[
     cached = cache.get(cache_key)
     if cached is not None:
         method.total_tokens += len(prompt.split()) + method.config.max_tokens_per_step
+        method.llm_calls += 1
         method.prompts.append(prompt)
-        return copy.deepcopy(cached)
+        plan = copy.deepcopy(cached)
+        method.initial_plan_snapshot = copy.deepcopy(plan)
+        method.initial_plan_fingerprint = hashlib.sha256(
+            json.dumps(plan, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return plan
     response = method.call_llm(prompt, method.config.max_tokens_per_step)
     plan = _coerce_plan_text(response, task)
     cache[cache_key] = copy.deepcopy(plan)
     task._shared_initial_plans = cache
+    method.initial_plan_snapshot = copy.deepcopy(plan)
+    method.initial_plan_fingerprint = hashlib.sha256(
+        json.dumps(plan, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
     return plan
 
 def _extract_json_payload(text: str) -> Any:
@@ -2988,6 +3005,96 @@ class AgentRxDiagnosisFailureLocalization(BaseRepairMethod):
             return int(resp.strip())
         except:
             return None
+
+# ----------------------------------------------------------------------
+# Baseline: AgentFixer single-trace recommendation retry
+# ----------------------------------------------------------------------
+class AgentFixerSingleTraceRecommendationRetry(BaseRepairMethod):
+    """Paper-inspired online adaptation of AgentFixer's single-trace RCA path.
+
+    The AgentFixer paper diagnoses deployed agents and recommends prompt/code
+    changes; it is not an official per-task online repair implementation. This
+    condition applies its hybrid validation, root-cause analysis, and
+    remediation-recommendation pattern once to the current trace.
+    """
+
+    def run_task_and_repair(self, task: Task) -> Dict[str, Any]:
+        self.task = task
+        start_time = time.time()
+        plan = self._generate_initial_plan(task)
+        self.last_plan = plan
+        step_results = self._execute_plan(plan, task)
+        contract_tree = _build_runtime_contract_tree(plan, task)
+        rule_failures = {
+            i + 1
+            for i, result in enumerate(step_results)
+            if not _verify_outcome(plan[i], result, contract_tree.get(str(i + 1)))
+        }
+        semantic_failures = self._semantic_failure_indices(task, plan, step_results)
+        diagnosed_failures = rule_failures | semantic_failures
+        reexecuted = 0
+        diagnosis = {}
+        if diagnosed_failures:
+            prompt = self._build_agentfixer_prompt(
+                task, plan, step_results, diagnosed_failures
+            )
+            payload = _extract_json_payload(self._call_llm_repair(prompt))
+            if isinstance(payload, dict):
+                diagnosis = {
+                    "validation_findings": payload.get("validation_findings", []),
+                    "root_cause": payload.get("root_cause", ""),
+                    "remediation": payload.get("remediation", ""),
+                }
+                repaired = _coerce_plan_text(payload.get("revised_plan", []), task)
+                if repaired:
+                    plan = repaired
+                    self.last_plan = plan
+                    step_results = self._execute_plan(plan, task)
+                    reexecuted = len(plan)
+        contract_tree = _build_runtime_contract_tree(plan, task)
+        contract_pass = sum(
+            1 for i, result in enumerate(step_results)
+            if _verify_outcome(plan[i], result, contract_tree.get(str(i + 1)))
+        ) / len(plan) if plan else 0.0
+        return {
+            "task_id": task.task_id,
+            "final_output": step_results[-1]["output"] if step_results else "",
+            "repair_prompt_tokens": self.repair_prompt_tokens_used,
+            "total_repair_tokens": self.total_tokens,
+            "repair_latency": time.time() - start_time,
+            "reexecuted_steps": reexecuted,
+            "untouched_sibling_ratio": (len(plan) - reexecuted) / len(plan) if plan else 1.0,
+            "taint_precision": 0.0,
+            "cascade_depth": reexecuted,
+            "contract_pass_rate": contract_pass,
+            "diagnosed_first_failure": min(diagnosed_failures) if diagnosed_failures else None,
+            "agentfixer_diagnosis": diagnosis,
+            "baseline_fidelity": "paper_inspired_single_trace_online_adaptation",
+            "prompts": self.prompts,
+        }
+
+    def _generate_initial_plan(self, task):
+        return _generate_shared_initial_plan(self, task)
+
+    def _execute_plan(self, plan, task):
+        return [benv.execute_tool(task, step["tool"], step.get("params", {})) for step in plan]
+
+    def _build_agentfixer_prompt(self, task, plan, step_results, diagnosed_failures):
+        return (
+            f"Task: {task.description}\nAvailable tools: {_format_tool_catalog(task)}\n"
+            f"Current plan: {json.dumps(plan, ensure_ascii=False)}\n"
+            f"Execution trace: {json.dumps(step_results, ensure_ascii=False)}\n"
+            f"Rule- or semantic-validator flagged steps: {sorted(diagnosed_failures)}\n"
+            "Perform AgentFixer-style single-trace root-cause analysis. First classify concrete "
+            "validation findings using only applicable categories such as tool selection, argument "
+            "validity, dependency/data flow, instruction following, consistency, completeness, or "
+            "output quality. Then identify the earliest actionable root cause and state a concise "
+            "remediation recommendation. Apply that recommendation once by returning a complete "
+            "smallest-sufficient revised plan. Do not assume a reference answer or hidden scorer. "
+            "Return one JSON object with keys validation_findings (list), root_cause (string), "
+            "remediation (string), and revised_plan (JSON list with step_idx, tool, params, "
+            "dependencies, outputs, and dependence_content)."
+        )
 
 # ----------------------------------------------------------------------
 # Diagnostic conditions: verifier authority and selective fallback

@@ -16,6 +16,7 @@ from methods import (
     ReflexionVerbalRetry,
     PostToolReflectionRAGRepair,
     AgentRxDiagnosisFailureLocalization,
+    AgentFixerSingleTraceRecommendationRetry,
     LocalLeafRetryNoAncestorControl,
     NoRepairControl,
     PGIRVisibleTaintLabels,
@@ -49,6 +50,7 @@ CONDITION_CLASSES = {
     "reflexion_verbal_retry": ReflexionVerbalRetry,
     "post_tool_reflection_rag_repair": PostToolReflectionRAGRepair,
     "agentrx_diagnosis_failure_localization": AgentRxDiagnosisFailureLocalization,
+    "agentfixer_single_trace_recommendation_retry": AgentFixerSingleTraceRecommendationRetry,
     "local_leaf_retry_no_ancestor_control": LocalLeafRetryNoAncestorControl,
     "pgir_visible_taint_labels": PGIRVisibleTaintLabels,
     "pgir_no_provenance_taint": PGIRNoProvenanceTaint,
@@ -104,7 +106,15 @@ class ExperimentHarness:
                     stratify = phase_config.get('stratify', False)
                     stratify_keys = phase_config.get('stratify_keys')
                     wilclawbench_categories = phase_config.get('wilclawbench_categories')
-                    tasks = load_dataset(dataset_name, subset_size, stratify, stratify_keys, wilclawbench_categories)
+                    load_subset_size = None if phase_config.get("fixed_task_ids") else subset_size
+                    tasks = load_dataset(
+                        dataset_name,
+                        load_subset_size,
+                        stratify,
+                        stratify_keys,
+                        wilclawbench_categories,
+                    )
+                    tasks = self._select_fixed_tasks(tasks, phase_config)
                     print(f"  Loaded {len(tasks)} tasks from {dataset_name}")
                     seeds = phase_config.get("seeds", [0])
                     for seed in seeds:
@@ -140,6 +150,23 @@ class ExperimentHarness:
                                     result.setdefault(
                                         "final_plan",
                                         getattr(repair_method, "last_plan", []),
+                                    )
+                                    result.setdefault(
+                                        "initial_plan_fingerprint",
+                                        getattr(repair_method, "initial_plan_fingerprint", ""),
+                                    )
+                                    result.setdefault(
+                                        "initial_plan",
+                                        getattr(repair_method, "initial_plan_snapshot", []),
+                                    )
+                                    result.setdefault("llm_calls", getattr(repair_method, "llm_calls", 0))
+                                    result.setdefault(
+                                        "repair_llm_calls",
+                                        getattr(repair_method, "repair_llm_calls", 0),
+                                    )
+                                    result.setdefault(
+                                        "search_calls",
+                                        getattr(getattr(repair_method, "search", None), "calls_made", 0),
                                     )
                                     if getattr(task, "benchmark_type", "") == "wildclawbench":
                                         raise RuntimeError(
@@ -182,6 +209,7 @@ class ExperimentHarness:
             self.results[phase_name] = phase_results
         self.compute_primary_metrics()
         self.check_tuning_parity()
+        self.check_baseline_fairness()
         self.check_contamination()
         self.emit_results()
 
@@ -202,13 +230,15 @@ class ExperimentHarness:
                 self.config.get_model_id(model)
             for dataset_name in phase_config["datasets"]:
                 subset_size = phase_config["subset_sizes"].get(dataset_name)
+                load_subset_size = None if phase_config.get("fixed_task_ids") else subset_size
                 tasks = load_dataset(
                     dataset_name,
-                    subset_size,
+                    load_subset_size,
                     phase_config.get("stratify", False),
                     phase_config.get("stratify_keys"),
                     phase_config.get("wilclawbench_categories"),
                 )
+                tasks = self._select_fixed_tasks(tasks, phase_config)
                 print(
                     f"PREFLIGHT phase={phase_name} dataset={dataset_name} "
                     f"tasks={len(tasks)} models={phase_config['models']} "
@@ -220,6 +250,16 @@ class ExperimentHarness:
                         "OpenClaw/Docker execution for scoring; this harness only "
                         "validates task discovery and sampling."
                     )
+
+    def _select_fixed_tasks(self, tasks, phase_config):
+        fixed_task_ids = [str(task_id) for task_id in phase_config.get("fixed_task_ids", [])]
+        if not fixed_task_ids:
+            return tasks
+        by_id = {str(task.task_id): task for task in tasks}
+        missing = [task_id for task_id in fixed_task_ids if task_id not in by_id]
+        if missing:
+            raise ValueError(f"Configured fixed_task_ids not found: {missing}")
+        return [by_id[task_id] for task_id in fixed_task_ids]
 
     def _budget_for_result(self, result):
         return {
@@ -359,6 +399,71 @@ class ExperimentHarness:
             "evidence": evidence,
         }
 
+    def check_baseline_fairness(self):
+        phases = {}
+        for phase_name, phase_results in self.results.items():
+            if not isinstance(phase_results, list):
+                continue
+            groups = {}
+            errors = []
+            for result in phase_results:
+                if "error" in result:
+                    errors.append({
+                        "task_id": result.get("task_id"),
+                        "condition": result.get("condition"),
+                        "error": result.get("error"),
+                    })
+                    continue
+                key = json.dumps({
+                    "model": result.get("model"),
+                    "dataset": result.get("dataset"),
+                    "seed": result.get("seed", 0),
+                    "task_id": str(result.get("task_id")),
+                }, sort_keys=True)
+                groups.setdefault(key, []).append(result)
+            mismatches = []
+            coverage = {}
+            for key, records in groups.items():
+                fingerprints = {
+                    record.get("condition"): record.get("initial_plan_fingerprint", "")
+                    for record in records
+                }
+                coverage[key] = sorted(fingerprints)
+                if not fingerprints or "" in fingerprints.values() or len(set(fingerprints.values())) != 1:
+                    mismatches.append({
+                        "group": json.loads(key),
+                        "fingerprints": fingerprints,
+                    })
+            expected_conditions = set(
+                self.config.phases_definition.get(phase_name, {}).get("conditions", [])
+            )
+            missing_conditions = [
+                {"group": json.loads(key), "missing": sorted(expected_conditions - set(conditions))}
+                for key, conditions in coverage.items()
+                if expected_conditions - set(conditions)
+            ]
+            phases[phase_name] = {
+                "pass": bool(groups) and not errors and not mismatches and not missing_conditions,
+                "groups_checked": len(groups),
+                "errors": errors,
+                "initial_plan_mismatches": mismatches,
+                "missing_conditions": missing_conditions,
+                "fixed_task_ids": self.config.phases_definition.get(phase_name, {}).get(
+                    "fixed_task_ids", []
+                ),
+                "fairness_policy": {
+                    "same_task_model_seed_initial_plan": True,
+                    "same_public_tool_catalog": True,
+                    "same_configured_token_caps": True,
+                    "method_intrinsic_extra_calls_allowed_and_reported": True,
+                    "gold_data_in_prompts_forbidden": True,
+                },
+            }
+        self.results["baseline_fairness_audit"] = {
+            "pass": bool(phases) and all(record["pass"] for record in phases.values()),
+            "phases": phases,
+        }
+
     def emit_results(self):
         os.makedirs(self.config.results_dir, exist_ok=True)
         outpath = os.path.join(self.config.results_dir, "results.json")
@@ -379,6 +484,9 @@ class ExperimentHarness:
             "taint_precision",
             "cascade_depth",
             "repair_calls",
+            "llm_calls",
+            "repair_llm_calls",
+            "search_calls",
             "boundary_repairs",
             "plan_boundary_triggers",
             "dependency_consumption_boundary_triggers",
