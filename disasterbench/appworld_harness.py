@@ -1,4 +1,9 @@
-"""AppWorld pilot runner using real AppWorld APIs and official evaluator."""
+"""Minimal AppWorld connectivity smoke runner.
+
+For official AppWorld experiments, use appworld_official_runner.py, which
+delegates execution to the AppWorld appworld-agents runner. This file is kept
+only for quick API/database/evaluator connectivity checks.
+"""
 
 from __future__ import annotations
 
