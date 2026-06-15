@@ -156,6 +156,20 @@ class Config:
                 "stratify_keys": ["workflow_structure", "failure_type"],
                 "seeds": [0],
             },
+            "main_table_disasterbench_20": {
+                "models": ["deepseek-v4-pro"],
+                "datasets": ["DisasterBench_pilot"],
+                "conditions": [
+                    "no_repair_control",
+                    "reflexion_verbal_retry",
+                    "agentdebug_critical_step_rerollout",
+                    "pgir_hidden_taint_ancestor_repair",
+                ],
+                "subset_sizes": {"DisasterBench_pilot": 20},
+                "stratify": True,
+                "stratify_keys": ["workflow_structure", "failure_type"],
+                "seeds": [0],
+            },
             "smoke_test": {
                 "models": ["deepseek-v4-pro"],
                 "datasets": ["DisasterBench_smoke"],

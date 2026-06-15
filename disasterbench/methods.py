@@ -3007,6 +3007,178 @@ class AgentRxDiagnosisFailureLocalization(BaseRepairMethod):
             return None
 
 # ----------------------------------------------------------------------
+# Baseline: AgentDebug critical-step feedback rerollout
+# ----------------------------------------------------------------------
+class AgentDebugCriticalStepRerollout(BaseRepairMethod):
+    """Faithful same-harness reproduction of AgentDebug's repair loop.
+
+    AgentDebug first diagnoses per-step module errors, then identifies the
+    earliest critical error and injects corrective feedback at that point
+    before rerolling from the critical step onward. This reproduction uses the
+    same task runner and scorer as PGIR, but does not use PGIR contracts,
+    provenance, frontier selection, or affected-closure repair.
+    """
+
+    MODULES = ["memory", "reflection", "planning", "action", "system"]
+
+    def run_task_and_repair(self, task: Task) -> Dict[str, Any]:
+        self.task = task
+        start_time = time.time()
+        plan = self._generate_initial_plan(task)
+        self.last_plan = plan
+        step_results = self._execute_plan(plan, task)
+        phase1 = self._agentdebug_phase1(task, plan, step_results)
+        critical = self._agentdebug_phase2(task, plan, step_results, phase1)
+        critical_step = self._critical_step(critical, len(plan))
+        reexecuted = 0
+        if critical_step is not None:
+            prompt = self._build_feedback_rerollout_prompt(
+                task, plan, step_results, phase1, critical, critical_step
+            )
+            suffix = _coerce_plan_text(self._call_llm_repair(prompt), task)
+            if suffix:
+                plan = plan[:critical_step - 1] + suffix
+                self.last_plan = plan
+                prefix_results = step_results[:critical_step - 1]
+                suffix_results = [
+                    benv.execute_tool(task, step["tool"], step.get("params", {}))
+                    for step in suffix
+                ]
+                step_results = prefix_results + suffix_results
+                reexecuted = len(suffix)
+        contract_tree = _build_runtime_contract_tree(plan, task)
+        contract_pass = sum(
+            1 for i, res in enumerate(step_results)
+            if i < len(plan) and _verify_outcome(plan[i], res, contract_tree.get(str(i + 1)))
+        ) / len(plan) if plan else 0.0
+        return {
+            "task_id": task.task_id,
+            "final_output": step_results[-1]["output"] if step_results else "",
+            "repair_prompt_tokens": self.repair_prompt_tokens_used,
+            "total_repair_tokens": self.total_tokens,
+            "repair_latency": time.time() - start_time,
+            "reexecuted_steps": reexecuted,
+            "untouched_sibling_ratio": (len(plan) - reexecuted) / len(plan) if plan else 1.0,
+            "taint_precision": 0.0,
+            "cascade_depth": reexecuted,
+            "contract_pass_rate": contract_pass,
+            "diagnosed_first_failure": critical_step,
+            "agentdebug_phase1": phase1,
+            "agentdebug_critical_error": critical,
+            "baseline_fidelity": "agentdebug_critical_error_feedback_rerollout_same_harness",
+            "prompts": self.prompts,
+        }
+
+    def _generate_initial_plan(self, task):
+        return _generate_shared_initial_plan(self, task)
+
+    def _execute_plan(self, plan, task):
+        return [benv.execute_tool(task, step["tool"], step.get("params", {})) for step in plan]
+
+    def _agentdebug_phase1(self, task, plan, step_results):
+        prompt = (
+            "You are reproducing AgentDebug Phase 1: step-level per-module "
+            "error detection. Analyze each step independently across memory, "
+            "reflection, planning, action, and system modules. Use only the "
+            "task, public tool schemas, the plan, and execution trace. Do not "
+            "assume a reference answer or hidden scorer.\n"
+            f"Task: {task.description}\nAvailable tools: {_format_tool_catalog(task)}\n"
+            f"Plan: {json.dumps(plan, ensure_ascii=False)}\n"
+            f"Trace: {json.dumps(step_results, ensure_ascii=False)}\n"
+            "Return JSON with key step_analyses. Each item must contain step, "
+            "errors, and step_summary. errors is an object over modules "
+            "memory/reflection/planning/action/system. Each module entry must "
+            "contain error_detected, error_type, evidence, and reasoning."
+        )
+        payload = _extract_json_payload(self.call_llm(prompt))
+        if isinstance(payload, dict) and isinstance(payload.get("step_analyses"), list):
+            return payload["step_analyses"]
+        return [
+            {
+                "step": i + 1,
+                "errors": {
+                    module: {
+                        "error_detected": not result.get("success") and module in {"action", "system"},
+                        "error_type": "tool_execution_error" if not result.get("success") and module == "system" else "no_error",
+                        "evidence": result.get("error") or result.get("output", ""),
+                        "reasoning": "Fallback Phase-1 record from execution success flag.",
+                    }
+                    for module in self.MODULES
+                },
+                "step_summary": result.get("output", ""),
+            }
+            for i, result in enumerate(step_results)
+        ]
+
+    def _agentdebug_phase2(self, task, plan, step_results, phase1):
+        prompt = (
+            "You are reproducing AgentDebug Phase 2: identify the earliest "
+            "critical error that caused task failure. Take a global causal view "
+            "over the whole trajectory. Do not select a later symptom when an "
+            "earlier planning/action/system error made success unlikely. Do not "
+            "use PGIR-style provenance, repair frontiers, or joint scope "
+            "selection.\n"
+            f"Task: {task.description}\nPlan: {json.dumps(plan, ensure_ascii=False)}\n"
+            f"Trace: {json.dumps(step_results, ensure_ascii=False)}\n"
+            f"Phase 1 step analyses: {json.dumps(phase1, ensure_ascii=False)}\n"
+            "Return exactly one JSON object with keys critical_step, "
+            "critical_module, error_type, root_cause, evidence, "
+            "correction_guidance, cascading_effects, and confidence. If the "
+            "trajectory has no actionable failure, set critical_step to null."
+        )
+        payload = _extract_json_payload(self.call_llm(prompt))
+        if isinstance(payload, dict):
+            return payload
+        first = self._first_failure(step_results)
+        return {
+            "critical_step": first,
+            "critical_module": "system" if first else "none",
+            "error_type": "tool_execution_error" if first else "no_error",
+            "root_cause": "Fallback critical step from first failed execution result.",
+            "evidence": "",
+            "correction_guidance": "Correct the first failed step and continue.",
+            "cascading_effects": [],
+            "confidence": 0.0,
+        }
+
+    def _critical_step(self, critical, plan_len):
+        if not isinstance(critical, dict):
+            return None
+        raw = critical.get("critical_step")
+        if raw in (None, "", "null", "none"):
+            return None
+        try:
+            step = int(raw)
+        except Exception:
+            return None
+        if 1 <= step <= plan_len:
+            return step
+        return None
+
+    def _build_feedback_rerollout_prompt(self, task, plan, step_results, phase1, critical, critical_step):
+        prefix = plan[:critical_step - 1]
+        return (
+            f"Task: {task.description}\nAvailable tools: {_format_tool_catalog(task)}\n"
+            f"Verified prefix to preserve: {json.dumps(prefix, ensure_ascii=False)}\n"
+            f"Original full plan: {json.dumps(plan, ensure_ascii=False)}\n"
+            f"Execution trace: {json.dumps(step_results, ensure_ascii=False)}\n"
+            f"AgentDebug Phase 1 analyses: {json.dumps(phase1, ensure_ascii=False)}\n"
+            f"AgentDebug critical error: {json.dumps(critical, ensure_ascii=False)}\n"
+            "Act as the same agent after receiving AgentDebug corrective feedback "
+            "at the critical step. Keep the verified prefix unchanged. Regenerate "
+            "only the critical step and the remaining suffix needed to complete "
+            "the task. Return the suffix as a JSON list with step_idx, tool, "
+            "params, dependencies, outputs, and dependence_content. Do not add "
+            "PGIR provenance reasoning or repair-frontier analysis."
+        )
+
+    def _first_failure(self, results):
+        for i, result in enumerate(results):
+            if not result.get("success"):
+                return i + 1
+        return None
+
+# ----------------------------------------------------------------------
 # Baseline: AgentFixer single-trace recommendation retry
 # ----------------------------------------------------------------------
 class AgentFixerSingleTraceRecommendationRetry(BaseRepairMethod):
